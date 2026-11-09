@@ -8,8 +8,14 @@
 #define BUTTON_PIN   27
 #define LED_HIJAU    32
 
+// --- GPS u-blox NEO-6M (UART2 ESP32) ---
+#define GPS_RX_PIN   16   // ESP32 RX2  <- TX modul GPS
+#define GPS_TX_PIN   17   // ESP32 TX2  -> RX modul GPS
+#define GPS_BAUD     9600 // Default NEO-6M
+
 Adafruit_MPU6050 mpu;
 TinyGPSPlus gps;
+HardwareSerial gpsSerial(2); // UART2
 
 enum SystemState { SIAGA, COUNTDOWN, DARURAT };
 SystemState currentState = SIAGA;
@@ -29,6 +35,20 @@ unsigned long lastHeartbeat = 0;
 const unsigned long HEARTBEAT_INTERVAL = 2000; // Siklus total 2000 ms (2 detik)
 const unsigned long FLASH_DURATION = 80;       // Hanya menyala 80 ms (hemat daya 96%)
 
+// Variabel pemantau GPS
+unsigned long lastGpsWarn = 0;
+
+// Teks status GPS singkat untuk telemetri
+String gpsStatusText() {
+  if (gps.charsProcessed() < 10) {
+    return "GPS: tidak ada data (cek kabel TX/RX)";
+  }
+  if (!gps.location.isValid()) {
+    return "GPS: mencari satelit (" + String(gps.satellites.isValid() ? gps.satellites.value() : 0) + " sat)";
+  }
+  return "GPS: FIX (" + String(gps.satellites.value()) + " sat)";
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -40,6 +60,12 @@ void setup() {
   digitalWrite(LED_HIJAU, LOW);
   digitalWrite(LED_MERAH, LOW);
   noTone(BUZZER_PIN);
+
+  // Inisialisasi GPS NEO-6M di UART2
+  // Buffer diperbesar agar data NMEA tidak hilang saat ada delay() debounce
+  gpsSerial.setRxBufferSize(1024);
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("[OK] UART2 GPS NEO-6M dimulai (9600 baud). Tunggu fix satelit di area terbuka.");
 
   Wire.begin(21, 22);
   if (!mpu.begin()) {
@@ -55,9 +81,16 @@ void setup() {
 }
 
 void loop() {
-  // Simulasi feed GPS
-  const char *nmeaData = "$GPRMC,083559.00,A,0746.2234,S,11024.4567,E,0.0,0.0,051126,,,A*7C\r\n";
-  for (int i = 0; nmeaData[i] != '\0'; i++) gps.encode(nmeaData[i]);
+  // Baca data NMEA asli dari modul GPS NEO-6M
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  // Peringatan jika 5 detik setelah boot GPS tidak mengirim data sama sekali
+  if (millis() > 5000 && gps.charsProcessed() < 10 && millis() - lastGpsWarn >= 5000) {
+    lastGpsWarn = millis();
+    Serial.println("[WARNING] Tidak ada data dari GPS. Periksa wiring: TX GPS -> GPIO16, RX GPS -> GPIO17, VCC, GND.");
+  }
 
   // Baca MPU6050
   sensors_event_t a, g, temp;
@@ -88,11 +121,14 @@ void loop() {
       // 2. Cetak telemetri SIAGA tiap 1 detik
       if (millis() - lastPrintTime >= 1000) {
         lastPrintTime = millis();
+        String gpsInfo = gpsStatusText();
         if (millis() < cancelGracePeriodUntil) {
           int sisa = (cancelGracePeriodUntil - millis()) / 1000 + 1;
-          Serial.printf("[SIAGA - JEDA %ds] a_total: %.2fg | Roll: %.1f° | Status: Abaikan trigger\n", sisa, a_total, roll);
+          Serial.printf("[SIAGA - JEDA %ds] a_total: %.2fg | Roll: %.1f° | %s | Status: Abaikan trigger\n",
+                        sisa, a_total, roll, gpsInfo.c_str());
         } else {
-          Serial.printf("[SIAGA] a_total: %.2fg | Roll: %.1f° | Status: Normal & Proteksi Aktif\n", a_total, roll);
+          Serial.printf("[SIAGA] a_total: %.2fg | Roll: %.1f° | %s | Status: Normal & Proteksi Aktif\n",
+                        a_total, roll, gpsInfo.c_str());
         }
       }
 
@@ -150,6 +186,9 @@ void loop() {
         if (gps.location.isValid()) {
           Serial.printf("[DARURAT] Koordinat TKP : Lat %.6f, Lng %.6f\n", gps.location.lat(), gps.location.lng());
           Serial.printf("[DARURAT] Link Maps: https://maps.google.com/?q=%.6f,%.6f\n", gps.location.lat(), gps.location.lng());
+          Serial.printf("[DARURAT] Usia data GPS: %lu ms | Satelit: %u\n", gps.location.age(), gps.satellites.value());
+        } else {
+          Serial.println("[DARURAT] Koordinat belum tersedia (GPS belum fix).");
         }
         Serial.println("==============================================\n");
         currentState = DARURAT;
